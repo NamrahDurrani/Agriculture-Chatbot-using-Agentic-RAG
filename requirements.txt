@@ -1,0 +1,23 @@
+# Agentic RAG Pipeline Dependencies
+# Install with: pip install -r requirements.txt
+
+# LLM API (free tier available)
+groq>=0.9.0
+
+# Vector database (local, no server needed)
+chromadb>=0.5.0
+
+# Embeddings (free, local, open-source)
+sentence-transformers>=2.7.0
+
+# PDF processing
+PyMuPDF>=1.24.0          # fitz - text extraction + rasterization
+pytesseract>=0.3.10      # OCR for scanned PDFs
+Pillow>=10.0.0           # image handling for OCR
+pypdf>=4.0.0             # fallback PDF reader
+
+# BM25 retrieval
+rank-bm25>=0.2.2
+
+# System requirement (not pip):
+# sudo apt-get install tesseract-ocr poppler-utils
