@@ -143,19 +143,4 @@ Each backend implements the same `call(system_prompt, user_prompt) -> text`
 interface, so the retrieval/evaluation logic never needs to know which
 provider is active.
 
-## Known, documented tradeoffs
 
-- **Semantic embeddings vs. exact-entity matching.** Switching from
-  TF-IDF to `sentence-transformers` fixed genuine semantic-gap failures
-  (e.g. a query using "onion thrips" now correctly retrieves content
-  written as "*Thrips tabaci*"), but weakened retrieval for queries
-  built around exact rare terms/acronyms (e.g. "PARC"), since semantic
-  vectors don't specially privilege literal exact matches the way
-  TF-IDF did. This is a known, empirically-observed tradeoff, not a bug.
-- **OCR accuracy on dense tables** is a known weak point of Tesseract's
-  layout recognition.
-- **The Orchestrator decides before retrieving** -- it can route a
-  question DIRECT (no retrieval) based on phrasing alone, even when the
-  corpus would have had relevant content.
-
-Full architecture rationale and node-by-node mapping: `docs/architecture.md`.
