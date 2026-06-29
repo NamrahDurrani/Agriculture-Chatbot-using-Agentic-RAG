@@ -1,112 +1,161 @@
-<<<<<<< HEAD
-# Agentic RAG Pipeline — Agricultural Documents
+# Agentic RAG Pipeline for Agricultural Documents
 
-## Project Structure
+An agentic Retrieval-Augmented Generation system that answers natural-
+language questions over a mixed corpus of agricultural PDFs -- including
+fully scanned, non-digital documents -- by retrieving evidence, verifying
+that evidence is actually sufficient before answering, and logging every
+decision into a normalized, auditable database.
 
-```
-agentic_rag/
-├── db_schema.py        # Normalized SQLite schema + helpers
-├── pdf_ingestor.py     # PDF text extraction (direct + OCR fallback)
-├── vector_store.py     # ChromaDB + TF-IDF embeddings (fully offline)
-├── rag_pipeline.py     # All 5 agents + RRF + logging
-├── main.py             # CLI entry point
-└── requirements.txt    # pip dependencies
-```
-
-## Quick Start (Google Colab)
-
-```python
-# Cell 1: Install dependencies
-!pip install chromadb groq pymupdf rank-bm25 scikit-learn pytesseract Pillow
-!apt-get install -y tesseract-ocr -q
-
-# Cell 2: Set Groq API key (free at console.groq.com)
-import os
-os.environ["GROQ_API_KEY"] = "gsk_your_key_here"
-
-# Cell 3: Copy PDF files to /content/pdfs/
-# Upload your PDFs through Colab's file panel
-
-# Cell 4: Index PDFs (first time only — PARC report OCR takes ~8 min for all pages)
-!python main.py --index --test   # --test = first 30 pages, fast
-# !python main.py --index        # full index (slower)
-
-# Cell 5: Ask questions
-!python main.py --query "What diseases affect wheat in Central Asia?"
-!python main.py --query "What research did PARC conduct on wheat in 2023-24?"
-!python main.py --query "What are the qualifications for Director General Agriculture Punjab?"
-```
-
-## Pipeline Architecture
+## Architecture
 
 ```
-User Query
-  │
-  ▼ [LLM 1] Query Rewriter — rewrites using conversation history
-  │
-  ▼ [LLM 2] Orchestrator — needs RAG? or answer directly?
-  │
-  ├─ DIRECT ──────────────────────────────► [LLM] Direct Answer
-  │
-  └─ RAG
-       │
-       ▼ ChromaDB Vector Search (TF-IDF)
-       ▼ BM25 Search (rank_bm25)
-       ▼ RRF Reranking (Reciprocal Rank Fusion)
-       │
-       ▼ [LLM 3] Relevance Evaluator
-       │
-       ├─ RELEVANT ─────────────────────► [LLM] Grounded Answer
-       │
-       └─ NOT RELEVANT
-              │
-              ├─ retries left? → Query Rewriter (with feedback) → retrieval again
-              └─ max retries → Safe Response
+                         User Query
+                             |
+                             v
+              +---------------------------+
+              |   Load Conversation        |
+              |   History (app logic)      |
+              +---------------------------+
+                             |
+                             v
+              +---------------------------+
+              |   Query Rewriter (LLM)     |
+              |   rewrite using context    |
+              +---------------------------+
+                             |
+                             v
+              +---------------------------+
+              |   Orchestrator (LLM)       |
+              |   does this need RAG?      |
+              +-------------+-------------+
+                 No |               | Yes
+                    v               v
+        +-----------------+   +------------------------+
+        |  Direct LLM      |   |  Retrieve: ChromaDB     |
+        |  answer          |   |  vector search + BM25   |
+        +-----------------+   |  (parallel, not an LLM   |
+                    |          |  call)                  |
+                    |          +-----------+--------------+
+                    |                      v
+                    |          +------------------------+
+                    |          |  Re-rank: RRF fusion    |
+                    |          |  (not an LLM call)      |
+                    |          +-----------+--------------+
+                    |                      v
+                    |          +------------------------+
+                    |          |  Relevance Evaluator    |
+                    |          |  (LLM): sufficient /    |
+                    |          |  partial / none         |
+                    |          +-----------+--------------+
+                    |             suff./partial |  none
+                    |                      v     v
+                    |          +-----------+  +---------------+
+                    |          | Generate   |  | Retry limit?  |
+                    |          | grounded,  |  | Yes -> rewrite|
+                    |          | cited      |  | with feedback,|
+                    |          | answer     |  | retry (max 2) |
+                    |          | (LLM)      |  | No  -> Safe   |
+                    |          +-----------+  | Response       |
+                    |                      |  +---------------+
+                    +----------------------+----+
+                                 v
+                       Return Response to User
+                                 v
+                  Save Query + Response + every
+                  intermediate step (normalized DB)
 ```
 
-## Database Schema (3NF Normalized)
+This implements every node in the original architecture diagram
+(`docs/RAG_architecture.pdf`), with two nodes deliberately extended
+beyond their literal description after real failures during
+development -- see `docs/architecture.md` for the full rationale.
 
+## What makes this "agentic," not just RAG
+
+- **Orchestrator** decides *whether* retrieval is even needed, before
+  spending time on it.
+- **Relevance Evaluator** checks retrieved evidence is actually
+  sufficient *before* generation -- a 3-state verdict (`sufficient` /
+  `partial` / `none`), not a blind retrieve-then-answer.
+- **Retry loop** automatically rewrites the query using the evaluator's
+  specific feedback and tries again (up to 2x) before falling back to
+  an honest "not found" response, rather than guessing.
+
+## The parsing challenge
+
+| Document | Type | Extraction method |
+|---|---|---|
+| FAO Guidelines for Monitoring Crop Diseases | Digitally typeset | Direct text-layer extraction (PyMuPDF) |
+| PARC Annual Report 2023-24 | Fully scanned, zero embedded fonts | OCR (Tesseract) |
+| Punjab Agriculture Dept. Service Rules | Fully scanned, zero embedded fonts | OCR (Tesseract) |
+
+Extraction strategy is decided **per page**, not per document: direct
+text extraction is tried first; if a page yields under 50 characters,
+it's rasterized and OCR'd instead. This correctly handles documents
+with mixed content rather than assuming one method per file.
+
+## Components
+
+| Component | Technology |
+|---|---|
+| PDF text extraction | PyMuPDF + Tesseract OCR (adaptive, per-page) |
+| Embeddings | sentence-transformers (`all-MiniLM-L6-v2`) -- semantic, CPU-friendly, local |
+| Vector store | ChromaDB (persistent, local) |
+| Sparse retrieval | BM25 |
+| Re-ranking | Reciprocal Rank Fusion (RRF) |
+| LLM | Configurable: Groq / Qwen3.5 (local or remote) / Ollama |
+| Logging | SQLite, normalized to 3NF, 6 linked tables |
+
+## Setup
+
+```bash
+python -m venv venv
+source venv/bin/activate        # Windows: venv\Scripts\activate
+pip install -r requirements.txt
 ```
-sessions ──────────┐
-                   │
-queries ───────────┤ (FK: session_id)
-    │              │
-    ├── pipeline_steps (FK: query_id)
-    │       │
-    │       └── llm_calls (FK: step_id)
-    │
-    ├── retrieved_docs (FK: query_id, step_id)
-    │
-    └── responses (FK: query_id, 1-to-1)
+
+Tesseract OCR must also be installed as a system package:
+- Windows: https://github.com/UB-Mannheim/tesseract/wiki
+- macOS: `brew install tesseract`
+- Linux: `sudo apt install tesseract-ocr`
+
+Place source PDFs in `pdfs/` (or set `PDF_DIR`).
+
+## Usage
+
+```bash
+export GROQ_API_KEY=gsk_...
+
+python main.py --index              # build the index (run once)
+python main.py --query "..."        # ask a single question
+python main.py --chat               # multi-turn conversation
+python main.py --inspect            # full trace of the last query
+python main.py --stats              # database statistics
 ```
 
-## Why These Tech Choices?
+See `docs/test_questions.md` for a curated set of questions exercising
+every distinct path through the pipeline.
 
-| Component | Choice | Why |
-|-----------|--------|-----|
-| LLM | `llama3-8b-8192` via Groq | Free tier, fast, 8K context |
-| Vector DB | ChromaDB (local) | No server, persistent, Colab-friendly |
-| Embeddings | TF-IDF (sklearn) | 100% offline, no HuggingFace download needed |
-| OCR | pytesseract + PyMuPDF | PARC & Punjab PDFs are scanned (0 text layer) |
-| BM25 | rank_bm25 | Exact keyword matching complements semantic search |
-| Reranking | RRF algorithm | Merges vector + BM25 ranked lists without LLM |
-| DB | SQLite | Zero setup, normalized, inspectable with DB Browser |
+## LLM backends
 
-## PDF Handling Strategy
+Set via `LLM_BACKEND`: `groq` (default) | `qwen_remote` | `qwen_local` | `ollama`.
+Each backend implements the same `call(system_prompt, user_prompt) -> text`
+interface, so the retrieval/evaluation logic never needs to know which
+provider is active.
 
-- **i5550e.pdf** (FAO Guidelines): 16 fonts → direct text extraction
-- **PARC_Annual_Report_2023-24.pdf**: 0 fonts → scanned → OCR via pytesseract
-- **PbAgriDeptExtenAdapReseWing_SR_2007.pdf**: 0 fonts → scanned → OCR
+## Known, documented tradeoffs
 
-## Upgrade to Sentence-Transformers (when HuggingFace accessible)
+- **Semantic embeddings vs. exact-entity matching.** Switching from
+  TF-IDF to `sentence-transformers` fixed genuine semantic-gap failures
+  (e.g. a query using "onion thrips" now correctly retrieves content
+  written as "*Thrips tabaci*"), but weakened retrieval for queries
+  built around exact rare terms/acronyms (e.g. "PARC"), since semantic
+  vectors don't specially privilege literal exact matches the way
+  TF-IDF did. This is a known, empirically-observed tradeoff, not a bug.
+- **OCR accuracy on dense tables** is a known weak point of Tesseract's
+  layout recognition.
+- **The Orchestrator decides before retrieving** -- it can route a
+  question DIRECT (no retrieval) based on phrasing alone, even when the
+  corpus would have had relevant content.
 
-In `vector_store.py`, replace `TFIDFEmbeddingFunction` with:
-```python
-from chromadb.utils import embedding_functions
-ef = embedding_functions.SentenceTransformerEmbeddingFunction(
-    model_name="all-MiniLM-L6-v2"
-)
-```
-=======
-# Agriculture-Chatbot-using-Agentic-RAG
->>>>>>> bffd069d3dbd5ba57852fc0b8077fce24737af82
+Full architecture rationale and node-by-node mapping: `docs/architecture.md`.
