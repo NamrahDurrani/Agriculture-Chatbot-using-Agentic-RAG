@@ -1,18 +1,26 @@
 """
 Vector Store Module
 ===================
-Uses ChromaDB (local, persistent) with TF-IDF embeddings (100% offline).
+Uses ChromaDB (local, persistent) with sentence-transformers embeddings
+(all-MiniLM-L6-v2) -- a genuinely semantic, CPU-friendly embedding model,
+replacing the earlier TF-IDF approach.
 
-Why TF-IDF instead of sentence-transformers?
-- sentence-transformers requires downloading from HuggingFace (may be blocked)
-- TF-IDF is fully local (sklearn), no downloads needed
-- For agricultural domain text with specific terminology, TF-IDF + BM25
-  actually works very well — specific crop/disease terms have high IDF scores
-- When HuggingFace access is available, swap TFIDFEmbeddingFunction for
-  the sentence-transformers version (see commented code at bottom)
+Why this model:
+- all-MiniLM-L6-v2 is small (~80MB), runs comfortably on CPU, no GPU needed
+- Produces dense semantic vectors -- understands meaning/synonyms, not
+  just literal word overlap (this is what TF-IDF could not do: e.g.
+  "onion thrips" vs "Thrips tabaci" now map to similar vectors)
+- One-time download from Hugging Face on first use, then cached locally
 
-Note: The vectorizer is fit on the first batch of documents, then saved
-to disk so subsequent queries use the same vocabulary.
+IMPORTANT: switching embedding functions requires re-indexing from
+scratch (--reset). TF-IDF vectors and sentence-transformers vectors are
+different mathematical spaces and cannot be mixed in the same
+collection.
+
+The original TFIDFEmbeddingFunction class is kept below (unused, not
+wired into _get_ef()) for reference/comparison -- it's what this project
+used before this swap, and demonstrates the reliability/semantic-quality
+tradeoff discussed in the project documentation.
 """
 
 import os
@@ -22,20 +30,24 @@ from typing import List, Tuple, Dict, Any
 
 import chromadb
 from chromadb import EmbeddingFunction, Documents, Embeddings
+from chromadb.utils import embedding_functions
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.preprocessing import normalize
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
-BASE_DIR        = os.path.dirname(__file__)
+BASE_DIR        = os.path.dirname(os.path.dirname(os.path.abspath(__file__))) \
+                   if os.path.basename(os.path.dirname(os.path.abspath(__file__))) == "src" \
+                   else os.path.dirname(os.path.abspath(__file__))
 CHROMA_DIR      = os.path.join(BASE_DIR, "chroma_db")
 VECTORIZER_PATH = os.path.join(BASE_DIR, "tfidf_vectorizer.pkl")
 COLLECTION_NAME = "agriculture_docs"
-TFIDF_DIM       = 2048   # vocabulary size for TF-IDF features
+TFIDF_DIM       = 2048   # vocabulary size for TF-IDF features (legacy, unused)
+EMBEDDING_MODEL = "all-MiniLM-L6-v2"   # current active embedding model
 
 # ── Singleton instances ───────────────────────────────────────────────────────
 _client:     chromadb.PersistentClient = None
 _collection  = None
-_ef:         "TFIDFEmbeddingFunction" = None
+_ef = None
 
 
 # ── Custom embedding function (offline TF-IDF) ────────────────────────────────
@@ -95,12 +107,23 @@ class TFIDFEmbeddingFunction(EmbeddingFunction):
         return self.transform(list(input)).tolist()
 
 
-# ── Client / collection init ──────────────────────────────────────────────────
+# ── Embedding function (semantic, via sentence-transformers) ─────────────────
 
-def _get_ef() -> TFIDFEmbeddingFunction:
+def _get_ef():
+    """
+    Returns ChromaDB's built-in SentenceTransformerEmbeddingFunction,
+    using all-MiniLM-L6-v2. Downloads the model from Hugging Face on
+    first use (~80MB), then caches it locally for subsequent runs --
+    no download needed after the first time.
+    """
     global _ef
     if _ef is None:
-        _ef = TFIDFEmbeddingFunction()
+        print(f"[VECTOR] Loading embedding model '{EMBEDDING_MODEL}' "
+              f"(downloads on first use, cached after)...")
+        _ef = embedding_functions.SentenceTransformerEmbeddingFunction(
+            model_name=EMBEDDING_MODEL
+        )
+        print(f"[VECTOR] Embedding model ready.")
     return _ef
 
 
@@ -114,6 +137,9 @@ def _get_client() -> chromadb.PersistentClient:
 
 
 def _get_collection():
+    """Collection uses the semantic embedding function from _get_ef()
+    above -- no fitting step needed, unlike the old TF-IDF approach,
+    since this model is already pretrained."""
     global _collection
     if _collection is None:
         client = _get_client()
@@ -136,12 +162,10 @@ def index_chunks(
     verbose: bool = True,
 ) -> int:
     """
-    Add text chunks to ChromaDB.
-
-    Strategy:
-      1. Collect ALL texts first and fit the TF-IDF vectorizer on them
-         (so it sees the full vocabulary before any insertions).
-      2. Then insert in batches.
+    Add text chunks to ChromaDB. The embedding model is pretrained
+    (no fitting step needed, unlike the previous TF-IDF approach) --
+    ChromaDB calls the embedding function automatically on each batch
+    added.
 
     Args:
         chunks:     List of (chunk_text, source_file, page_num).
@@ -152,14 +176,6 @@ def index_chunks(
         Number of chunks added.
     """
     import uuid
-
-    ef = _get_ef()
-    all_texts = [text for text, _, _ in chunks]
-
-    # Step 1: Fit TF-IDF on the full corpus (if not already fitted)
-    if not ef.is_fitted():
-        print(f"[VECTOR] Fitting TF-IDF on {len(all_texts)} texts...")
-        ef.fit(all_texts)
 
     collection = _get_collection()
 
@@ -231,17 +247,20 @@ def collection_size() -> int:
 
 
 def reset_collection():
-    """Delete and recreate the collection."""
+    """Delete and recreate the collection. Required when switching
+    embedding functions (e.g. TF-IDF -> sentence-transformers), since
+    vectors from different embedding spaces cannot coexist."""
     client = _get_client()
     try:
         client.delete_collection(COLLECTION_NAME)
         print(f"[VECTOR] Deleted collection '{COLLECTION_NAME}'")
     except Exception:
         pass
-    # Also delete fitted vectorizer so it re-fits on new data
+    # Clean up the legacy TF-IDF vectorizer file if it exists from a
+    # previous run -- harmless no-op if it doesn't.
     if os.path.exists(VECTORIZER_PATH):
         os.remove(VECTORIZER_PATH)
-        print("[VECTOR] Deleted TF-IDF vectorizer")
+        print("[VECTOR] Deleted legacy TF-IDF vectorizer file")
     global _collection, _ef
     _collection = None
     _ef = None
@@ -256,16 +275,3 @@ if __name__ == "__main__":
             print(f"\n[{r['source_file']} p.{r['page_num']}] "
                   f"score={r['vector_score']}")
             print(r["chunk_text"][:200])
-
-# ── NOTE: To use sentence-transformers when HF is accessible ─────────────────
-# Replace the collection init with:
-#
-# from chromadb.utils import embedding_functions
-# ef = embedding_functions.SentenceTransformerEmbeddingFunction(
-#     model_name="all-MiniLM-L6-v2"
-# )
-# _collection = client.get_or_create_collection(
-#     name=COLLECTION_NAME,
-#     embedding_function=ef,
-#     metadata={"hnsw:space": "cosine"},
-# )
